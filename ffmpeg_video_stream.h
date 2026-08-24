@@ -97,6 +97,13 @@ class FFmpegVideoStreamPlayback : public VideoStreamPlayback {
 	GDCLASS(FFmpegVideoStreamPlayback, VideoStreamPlayback);
 
 	const int LENIENCE_BEFORE_SEEK = 2500;
+	// How far ahead of the playhead an audio frame may be handed to Godot's ring buffer.
+	// Handing audio over only once it is due leaves the mixer with almost no headroom:
+	// delivery happens once per rendered frame, so any main-thread hitch longer than a
+	// frame starves the ring and Godot fades the rest of its mix block to silence — an
+	// audible crackle (issue #9). The ring drains in real time, so pushing early only
+	// builds headroom; it does not shift A/V sync.
+	const double AUDIO_PREBUFFER_MS = 100.0;
 	double playback_position = 0.0f;
 
 	Ref<VideoDecoder> decoder;

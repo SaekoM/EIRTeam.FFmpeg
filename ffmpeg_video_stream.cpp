@@ -127,7 +127,7 @@ bool FFmpegVideoStreamPlayback::check_next_audio_frame_valid(Ref<DecodedAudioFra
 	if (looping && Math::abs((p_decoded_frame->get_time() - decoder->get_duration()) - playback_position) < LENIENCE_BEFORE_SEEK)
 		return true;
 
-	return p_decoded_frame->get_time() <= playback_position && Math::abs(p_decoded_frame->get_time() - playback_position) < LENIENCE_BEFORE_SEEK;
+	return p_decoded_frame->get_time() <= playback_position + AUDIO_PREBUFFER_MS && Math::abs(p_decoded_frame->get_time() - playback_position) < LENIENCE_BEFORE_SEEK;
 }
 
 const char *const upd_str = "update_internal";
@@ -246,6 +246,13 @@ void FFmpegVideoStreamPlayback::update_internal(double p_delta) {
 		// TODO: seek audio stream individually if it desyncs
 	}
 
+	// Take everything the decode thread has produced, every update. The old code only
+	// transferred when the local list was empty, which was fine when frames were pushed
+	// exactly on time; with the prebuffer window the list must stay stocked ahead.
+	for (Ref<DecodedAudioFrame> frame : decoder->get_decoded_audio_frames()) {
+		available_audio_frames.push_back(frame);
+	}
+
 	List<Ref<DecodedAudioFrame>>::Element *next_audio_frame = available_audio_frames.front();
 	while (next_audio_frame && check_next_audio_frame_valid(next_audio_frame->get())) {
 		ZoneNamedN(__audio_mix, "Audio mix", true);
@@ -258,11 +265,6 @@ void FFmpegVideoStreamPlayback::update_internal(double p_delta) {
 #endif
 		next_audio_frame = next_audio_frame->next();
 		available_audio_frames.pop_front();
-	}
-	if (available_audio_frames.size() == 0) {
-		for (Ref<DecodedAudioFrame> frame : decoder->get_decoded_audio_frames()) {
-			available_audio_frames.push_back(frame);
-		}
 	}
 
 	buffering = decoder->is_running() && available_frames.size() == 0;
