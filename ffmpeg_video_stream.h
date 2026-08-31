@@ -67,7 +67,14 @@ class YUVGPUConverter : public RefCounted {
 	// the plane textures are R8_UNORM or R16_UNORM, and how many bytes per sample arrive from the
 	// decoder. Changing it tears down the pipeline, the textures AND the uniform sets, because a
 	// uniform set is created against a specific shader and cannot be rebound to another.
+	//
+	// TWO fields, because two threads. `pending_bit_depth` is written by the main thread as frames
+	// arrive; `bit_depth` is what the GPU resources are actually built for and is only ever touched on
+	// the RENDER thread, inside _convert_internal. Every other RD call in this class is marshalled
+	// there by call_on_render_thread, and freeing RIDs from the main thread instead raced a conversion
+	// that was already queued - which surfaced as "Attempted to free invalid ID".
 	int bit_depth = 8;
+	int pending_bit_depth = 8;
 
 	struct PushConstant {
 		uint32_t use_alpha;
@@ -81,10 +88,12 @@ private:
 	RID _create_uniform_set(const RID &p_texture_rd_rid, int p_shader_set);
 	void _upload_plane_images();
 	void _clear_texture_internal();
+	void _release_depth_dependent_resources();
 	void _convert_internal();
 
 public:
-	// Call before set_plane_image for a frame. A no-op unless the depth actually changed.
+	// Records what the decoder is now producing. Cheap and thread-safe: the actual teardown happens on
+	// the render thread the next time convert() runs.
 	void set_bit_depth(int p_bit_depth);
 	void set_plane_image(int p_plane_idx, Ref<Image> p_image);
 	Vector2i get_frame_size() const;

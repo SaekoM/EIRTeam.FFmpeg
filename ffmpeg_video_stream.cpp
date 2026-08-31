@@ -457,7 +457,6 @@ void YUVGPUConverter::_ensure_pipeline() {
 			vformat("Could not create the %d-bit YUV compute shader. Playback of that bit depth will fail.", bit_depth));
 	pipeline = rd->compute_pipeline_create(shader);
 	ERR_FAIL_COND_MSG(!pipeline.is_valid(), vformat("Could not create the %d-bit YUV compute pipeline.", bit_depth));
-	print_line(vformat("[10bitdiag] pipeline built for %d-bit", bit_depth));  // TEMPORARY DIAGNOSTIC
 }
 
 Error YUVGPUConverter::_ensure_plane_textures() {
@@ -626,22 +625,30 @@ void YUVGPUConverter::set_plane_image(int p_plane_idx, Ref<Image> p_image) {
 	ERR_FAIL_COND_MSG(p_image->get_height() != desired_frame_height, vformat("Wrong YUV plane height for plane %, expected %d got %d", p_plane_idx, desired_frame_height, p_image->get_height()));
 	// FORMAT_RH is the 2-bytes-per-pixel carrier used for 10-bit planes - see _unwrap_yuv_frame. It is
 	// never read as half-float; the RD texture's R16_UNORM format is what gives the bytes meaning.
-	const Image::Format expected_format = bit_depth > 8 ? Image::FORMAT_RH : Image::FORMAT_R8;
+	// pending_bit_depth, not bit_depth: this runs on the main thread alongside the incoming frames,
+	// while bit_depth still describes GPU resources the render thread has not rebuilt yet.
+	const Image::Format expected_format = pending_bit_depth > 8 ? Image::FORMAT_RH : Image::FORMAT_R8;
 	ERR_FAIL_COND_MSG(p_image->get_format() != expected_format,
-			vformat("Wrong image format for %d-bit planes, expected %d got %d", bit_depth, expected_format, p_image->get_format()));
+			vformat("Wrong image format for %d-bit planes, expected %d got %d", pending_bit_depth, expected_format, p_image->get_format()));
 	yuv_plane_images[p_plane_idx] = p_image;
 }
 
 void YUVGPUConverter::set_bit_depth(int p_bit_depth) {
-	if (bit_depth == p_bit_depth) {
-		return;
-	}
-	bit_depth = p_bit_depth;
-	print_line(vformat("[10bitdiag] set_bit_depth -> %d", bit_depth));  // TEMPORARY DIAGNOSTIC
+	// Main thread. Record only - no RenderingDevice calls here. _convert_internal picks this up on the
+	// render thread and does the teardown there.
+	pending_bit_depth = p_bit_depth;
+}
 
-	// Everything downstream of the depth is now wrong: the shader's format qualifier, the plane
-	// textures' data format, and the uniform sets (which are created against a specific shader and
-	// cannot be rebound). Drop them all and let the _ensure_* calls rebuild on the next convert().
+// RENDER THREAD ONLY, from _convert_internal. Frees everything whose format depends on the bit depth:
+// the shader and pipeline (their image format qualifiers are baked in), the plane textures (R8 vs R16)
+// and every uniform set (a set is created against a specific shader and cannot be rebound).
+//
+// The plane IMAGES are deliberately left alone - the main thread has already filled them with the frame
+// that is about to be converted, and unref-ing them here would throw that frame away.
+//
+// The output TEXTURE is left alone too: it is the same Texture2DRD the VideoStreamPlayer is holding and
+// drawing. Only its uniform set is dropped; _ensure_output_texture rebuilds that on its early path.
+void YUVGPUConverter::_release_depth_dependent_resources() {
 	if (pipeline.is_valid()) {
 		FREE_RD_RID(pipeline);
 		pipeline = RID();
@@ -659,12 +666,7 @@ void YUVGPUConverter::set_bit_depth(int p_bit_depth) {
 			FREE_RD_RID(yuv_plane_textures[i]);
 			yuv_plane_textures[i] = RID();
 		}
-		yuv_plane_images[i].unref();
 	}
-	// The output uniform set is bound to the old shader as well, so it goes too. The output TEXTURE is
-	// deliberately left alone: it is the same Texture2DRD the VideoStreamPlayer is holding and drawing,
-	// and freeing it out from under a live reference is a dangling pointer waiting to happen. Only the
-	// set is rebuilt - see the missing-set branch in _ensure_output_texture.
 	if (out_uniform_set.is_valid()) {
 		FREE_RD_RID(out_uniform_set);
 		out_uniform_set = RID();
@@ -688,6 +690,13 @@ void YUVGPUConverter::convert() {
 }
 
 void YUVGPUConverter::_convert_internal() {
+	// Render thread. Adopt any depth change the main thread recorded, and drop what it invalidates,
+	// before anything below asks for those resources.
+	if (pending_bit_depth != bit_depth) {
+		bit_depth = pending_bit_depth;
+		_release_depth_dependent_resources();
+	}
+
 	// First we must ensure everything we need exists
 	_ensure_pipeline();
 	_ensure_plane_textures();
@@ -710,7 +719,6 @@ void YUVGPUConverter::_convert_internal() {
 				vformat("YUV plane uniform set %d is invalid; refusing to dispatch.", (int)i));
 	}
 
-	print_line("[10bitdiag] about to dispatch");  // TEMPORARY DIAGNOSTIC
 	ComputeListID compute_list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(compute_list, pipeline);
 
@@ -727,7 +735,6 @@ void YUVGPUConverter::_convert_internal() {
 
 	rd->compute_list_dispatch(compute_list, Math::ceil(frame_size.x / 8.0f), Math::ceil(frame_size.y / 8.0f), 1);
 	rd->compute_list_end();
-	print_line("[10bitdiag] dispatch survived");  // TEMPORARY DIAGNOSTIC
 }
 
 Ref<Texture2D> YUVGPUConverter::get_output_texture() const {
