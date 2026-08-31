@@ -446,11 +446,19 @@ void YUVGPUConverter::_ensure_pipeline() {
 
 #endif
 	shader = rd->shader_create_from_spirv(shader_spirv);
+	ERR_FAIL_COND_MSG(!shader.is_valid(),
+			vformat("Could not create the %d-bit YUV compute shader. Playback of that bit depth will fail.", bit_depth));
 	pipeline = rd->compute_pipeline_create(shader);
+	ERR_FAIL_COND_MSG(!pipeline.is_valid(), vformat("Could not create the %d-bit YUV compute pipeline.", bit_depth));
 }
 
 Error YUVGPUConverter::_ensure_plane_textures() {
 	RD *rd = RS::get_singleton()->get_rendering_device();
+	// A uniform set is created against the shader, so an invalid shader here becomes a hard crash
+	// inside uniform_set_create rather than an error. Fail loudly instead - this is the only warning
+	// anyone gets if a shader variant does not compile on their driver.
+	ERR_FAIL_COND_V_MSG(!shader.is_valid(), ERR_CANT_CREATE,
+			vformat("YUV converter has no valid shader for %d-bit planes; cannot build plane textures.", bit_depth));
 	for (size_t i = 0; i < std::size(yuv_plane_textures); i++) {
 		const RenderingDevice::DataFormat desired_data_format =
 				bit_depth > 8 ? RenderingDevice::DATA_FORMAT_R16_UNORM : RenderingDevice::DATA_FORMAT_R8_UNORM;
@@ -481,7 +489,12 @@ Error YUVGPUConverter::_ensure_plane_textures() {
 		new_format.depth = 1;
 		new_format.array_layers = 1;
 		new_format.mipmaps = 1;
-		new_format.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT | RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_CAN_UPDATE_BIT;
+		// No COLOR_ATTACHMENT: these are storage images filled from the CPU and read by the compute
+		// shader; nothing ever renders into them. It was harmless-but-pointless at R8_UNORM, where
+		// Vulkan mandates colour-attachment support. R16_UNORM mandates NEITHER colour attachment nor
+		// storage, so asking for capabilities the format may not have is how a 10-bit plane fails to
+		// create at all.
+		new_format.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_CAN_UPDATE_BIT;
 
 #ifdef GDEXTENSION
 		Ref<RDTextureFormat> new_format_c = new_format.get_texture_format();
@@ -492,12 +505,17 @@ Error YUVGPUConverter::_ensure_plane_textures() {
 		RDTextureViewC texture_view;
 #endif
 		yuv_plane_textures[i] = rd->texture_create(new_format_c, texture_view);
+		ERR_FAIL_COND_V_MSG(!yuv_plane_textures[i].is_valid(), ERR_CANT_CREATE,
+				vformat("Could not create %d-bit YUV plane texture %d (%dx%d). The driver may not support this format as a storage image.",
+						bit_depth, (int)i, (int)new_format.width, (int)new_format.height));
 
 		if (yuv_planes_uniform_sets[i].is_valid()) {
 			FREE_RD_RID(yuv_planes_uniform_sets[i]);
 		}
 
 		yuv_planes_uniform_sets[i] = _create_uniform_set(yuv_plane_textures[i], i);
+		ERR_FAIL_COND_V_MSG(!yuv_planes_uniform_sets[i].is_valid(), ERR_CANT_CREATE,
+				vformat("Could not create uniform set for YUV plane %d.", (int)i));
 	}
 
 	return OK;
@@ -513,6 +531,13 @@ Error YUVGPUConverter::_ensure_output_texture() {
 	if (out_texture->get_texture_rd_rid().is_valid()) {
 		RDTextureFormatC format = TEXTURE_FORMAT_COMPAT(rd->texture_get_format(out_texture->get_texture_rd_rid()));
 		if (static_cast<int>(format.width) == frame_size.width && static_cast<int>(format.height) == frame_size.height) {
+			// The texture is still the right shape, but a bit-depth change drops the uniform set
+			// bound to the old shader. Rebuild just that; the texture itself never has to move.
+			if (!out_uniform_set.is_valid()) {
+				out_uniform_set = _create_uniform_set(out_texture->get_texture_rd_rid(), 4);
+				ERR_FAIL_COND_V_MSG(!out_uniform_set.is_valid(), ERR_CANT_CREATE,
+						"Could not recreate the output uniform set after a bit-depth change.");
+			}
 			return OK;
 		}
 	}
@@ -627,17 +652,13 @@ void YUVGPUConverter::set_bit_depth(int p_bit_depth) {
 		}
 		yuv_plane_images[i].unref();
 	}
-	// The output uniform set is bound to the old shader too. Freeing it alone is NOT enough:
-	// _ensure_output_texture returns early whenever the output texture already matches the frame size,
-	// and the uniform set is only created on the path past that check - so it would stay dead and the
-	// dispatch would bind an invalid set. Clear the texture's RID as well to force the full rebuild.
+	// The output uniform set is bound to the old shader as well, so it goes too. The output TEXTURE is
+	// deliberately left alone: it is the same Texture2DRD the VideoStreamPlayer is holding and drawing,
+	// and freeing it out from under a live reference is a dangling pointer waiting to happen. Only the
+	// set is rebuilt - see the missing-set branch in _ensure_output_texture.
 	if (out_uniform_set.is_valid()) {
 		FREE_RD_RID(out_uniform_set);
 		out_uniform_set = RID();
-	}
-	if (out_texture.is_valid() && out_texture->get_texture_rd_rid().is_valid()) {
-		FREE_RD_RID(out_texture->get_texture_rd_rid());
-		out_texture->set_texture_rd_rid(RID());
 	}
 }
 
@@ -671,6 +692,14 @@ void YUVGPUConverter::_convert_internal() {
 	PackedByteArray push_constant_data;
 	push_constant_data.resize(sizeof(push_constant));
 	memcpy(push_constant_data.ptrw(), &push_constant, push_constant_data.size());
+
+	// Bailing here is what turns "the window vanished" into a line in the log.
+	ERR_FAIL_COND(!pipeline.is_valid());
+	ERR_FAIL_COND(!out_uniform_set.is_valid());
+	for (size_t i = 0; i < std::size(yuv_planes_uniform_sets); i++) {
+		ERR_FAIL_COND_MSG(!yuv_planes_uniform_sets[i].is_valid(),
+				vformat("YUV plane uniform set %d is invalid; refusing to dispatch.", (int)i));
+	}
 
 	ComputeListID compute_list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(compute_list, pipeline);
