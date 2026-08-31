@@ -45,24 +45,30 @@ jobs:
       - name: Setup MSVC problem matcher
         uses: ammaraskar/msvc-problem-matcher@master
 
+      # Points at SaekoM/FFmpeg-Builds, not EIRTeam's. That release is frozen at 2023-07-24 and its
+      # libavcodec is 60.22.100 — an unreleased master snapshot. Building against it while the game
+      # ships n6.1.6 (60.31.102) is an ABI mismatch: AVCodecParameters gained coded_side_data and
+      # nb_coded_side_data, and video_decoder.cpp copies that struct BY VALUE, so the copy is short
+      # and avcodec_parameters_to_context reads garbage and fails with ENOMEM on every file.
+      # The n6.1 name is stable across rebuilds while the pin stays on release/6.1.
       - uses: suisei-cn/actions-download-file@v1
         id: downloadfile
         name: Download the file
         with:
-          url: "https://github.com/EIRTeam/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl-godot.tar.xz"
+          url: "https://github.com/SaekoM/FFmpeg-Builds/releases/download/latest/ffmpeg-n6.1-latest-win64-lgpl-godot.tar.xz"
           target: .
 
       - name: Extract tgz
         uses: ihiroky/extract-action@v1
         with:
-          file_path: ffmpeg-master-latest-win64-lgpl-godot.tar.xz
+          file_path: ffmpeg-n6.1-latest-win64-lgpl-godot.tar.xz
           extract_dir: .
 
       - name: Compilation
         uses: ./.github/actions/build
         with:
           sconsflags: ${{ env.SCONSFLAGS }} ${{ matrix.sconsflags }}
-          ffmpeg-path: "../ffmpeg-master-latest-win64-lgpl-godot/"
+          ffmpeg-path: "../ffmpeg-n6.1-latest-win64-lgpl-godot/"
           platform: windows
           target: ${{ matrix.target }}
           tests: ${{ matrix.tests }}

@@ -40,8 +40,14 @@ jobs:
 
       - name: Download ffmpeg
         run: |
-          wget https://github.com/EIRTeam/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-lgpl-godot.tar.xz
-          tar xvf ffmpeg-master-latest-linux64-lgpl-godot.tar.xz
+          # Points at SaekoM/FFmpeg-Builds, not EIRTeam's. That release is frozen at 2023-07-24 and its
+          # libavcodec is 60.22.100 — an unreleased master snapshot. Building against it while the game
+          # ships n6.1.6 (60.31.102) is an ABI mismatch: AVCodecParameters gained coded_side_data and
+          # nb_coded_side_data, and video_decoder.cpp copies that struct BY VALUE, so the copy is short
+          # and avcodec_parameters_to_context reads garbage and fails with ENOMEM on every file.
+          # The n6.1 name is stable across rebuilds while the pin stays on release/6.1.
+          wget https://github.com/SaekoM/FFmpeg-Builds/releases/download/latest/ffmpeg-n6.1-latest-linux64-lgpl-godot.tar.xz
+          tar xvf ffmpeg-n6.1-latest-linux64-lgpl-godot.tar.xz
 
       - name: Setup python and scons
         uses: ./.github/actions/deps
@@ -50,7 +56,7 @@ jobs:
         uses: ./.github/actions/build
         with:
           sconsflags: ${{ env.SCONSFLAGS }} ${{ matrix.sconsflags }}
-          ffmpeg-path: "../ffmpeg-master-latest-linux64-lgpl-godot/"
+          ffmpeg-path: "../ffmpeg-n6.1-latest-linux64-lgpl-godot/"
           platform: linux
           target: ${{ matrix.target }}
           tests: ${{ matrix.tests }}
