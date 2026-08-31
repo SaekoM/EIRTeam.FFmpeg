@@ -199,6 +199,10 @@ void FFmpegVideoStreamPlayback::update_internal(double p_delta) {
 			Ref<Image> v_plane = last_frame->get_yuv_image_plane(2);
 			Ref<Image> a_plane = last_frame->get_yuv_image_plane(3);
 
+			// If load() and this branch ever disagree about what counts as YUV again, say so instead of
+			// dereferencing nothing.
+			ERR_FAIL_COND_MSG(!yuv_converter.is_valid(),
+					"Frame is YUV but no YUV converter was created in load(); the two format tests disagree.");
 			ERR_FAIL_COND(!y_plane.is_valid());
 			ERR_FAIL_COND(!u_plane.is_valid());
 			ERR_FAIL_COND(!v_plane.is_valid());
@@ -287,7 +291,10 @@ Error FFmpegVideoStreamPlayback::load(Ref<FileAccess> p_file_access) {
 		return FAILED;
 	}
 
-	if (decoder->get_frame_format() == FFmpegFrameFormat::YUV420P || decoder->get_frame_format() == FFmpegFrameFormat::YUVA420P) {
+	// MUST use the same test as the dispatch in update_internal. When these two disagree - as they did
+	// when 10-bit was added here but not there - the converter is never instantiated for the new format
+	// while the update path still calls into it, which is a null dereference and a hard crash.
+	if (ffmpeg_frame_format_is_yuv(decoder->get_frame_format())) {
 		yuv_converter.instantiate();
 		yuv_converter->set_frame_size(size);
 		yuv_texture = yuv_converter->get_output_texture();
