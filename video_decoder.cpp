@@ -222,6 +222,10 @@ Error VideoDecoder::recreate_codec_context() {
 		}
 	}
 
+	// TEMPORARY DIAGNOSTIC - remove once the 10-bit path is proven.
+	print_line(vformat("[10bitdiag] pix_fmt=%d frame_format=%d rendering_device=%d",
+			(int)codec_params->format, (int)frame_format, (int)has_rendering_device));
+
 	const AVCodec *decoder = forced_video_codec;
 	if (!decoder) {
 		decoder = avcodec_find_decoder(video_stream->codecpar->codec_id);
@@ -630,8 +634,21 @@ Ref<DecodedFrame> VideoDecoder::_unwrap_yuv_frame(double p_frame_time, Ref<FFmpe
 		}
 
 		const int plane_size = p_frame->get_frame()->linesize[plane_i] * height;
+		// TEMPORARY DIAGNOSTIC - first frames only, to find where 10-bit dies.
+		static int diag_frames = 0;
+		const bool diag = diag_frames < 8;
+		if (diag) {
+			diag_frames++;
+			print_line(vformat("[10bitdiag] plane=%d w=%d h=%d linesize=%d bps=%d plane_size=%d need=%d data=%d",
+					(int)plane_i, width, height, (int)p_frame->get_frame()->linesize[plane_i],
+					bytes_per_sample, plane_size, width * height * bytes_per_sample,
+					(int)(p_frame->get_frame()->data[plane_i] != nullptr)));
+		}
 		temp_frame_storage.resize(plane_size);
 		uint8_t *unwrapped_frame_ptrw = temp_frame_storage.ptrw();
+		if (diag) {
+			print_line(vformat("[10bitdiag]   resized ok, ptr=%d", (int)(unwrapped_frame_ptrw != nullptr)));
+		}
 		{
 			ZoneNamedN(yuv_image_unwrap_memcopy, "YUV memcpy", true);
 			const int row_bytes = width * bytes_per_sample;
@@ -640,13 +657,21 @@ Ref<DecodedFrame> VideoDecoder::_unwrap_yuv_frame(double p_frame_time, Ref<FFmpe
 				unwrapped_frame_ptrw += row_bytes;
 			}
 		}
+		if (diag) {
+			print_line("[10bitdiag]   memcpy loop done");
+		}
 		temp_frame_storage.resize(width * height * bytes_per_sample);
 		// FORMAT_RH is used as a 2-BYTES-PER-PIXEL CONTAINER, not as half-float data. Godot's Image has
 		// no R16_UNORM, and nothing here interprets the bytes: _upload_plane_images hands them straight
 		// to texture_update, and the RD texture's own format (R16_UNORM) decides what they mean. Do not
 		// "correct" this to a float format.
 		const Image::Format plane_format = bytes_per_sample == 2 ? Image::FORMAT_RH : Image::FORMAT_R8;
-		out_frame->set_yuv_image_plane(plane_i, Image::create_from_data(width, height, false, plane_format, temp_frame_storage));
+		Ref<Image> plane_image = Image::create_from_data(width, height, false, plane_format, temp_frame_storage);
+		if (diag) {
+			print_line(vformat("[10bitdiag]   image made valid=%d fmt=%d size=%d",
+					(int)plane_image.is_valid(), (int)plane_format, (int)temp_frame_storage.size()));
+		}
+		out_frame->set_yuv_image_plane(plane_i, plane_image);
 	}
 
 	out_frame->set_format(p_out_format);

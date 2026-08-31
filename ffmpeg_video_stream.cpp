@@ -450,6 +450,7 @@ void YUVGPUConverter::_ensure_pipeline() {
 			vformat("Could not create the %d-bit YUV compute shader. Playback of that bit depth will fail.", bit_depth));
 	pipeline = rd->compute_pipeline_create(shader);
 	ERR_FAIL_COND_MSG(!pipeline.is_valid(), vformat("Could not create the %d-bit YUV compute pipeline.", bit_depth));
+	print_line(vformat("[10bitdiag] pipeline built for %d-bit", bit_depth));  // TEMPORARY DIAGNOSTIC
 }
 
 Error YUVGPUConverter::_ensure_plane_textures() {
@@ -629,6 +630,7 @@ void YUVGPUConverter::set_bit_depth(int p_bit_depth) {
 		return;
 	}
 	bit_depth = p_bit_depth;
+	print_line(vformat("[10bitdiag] set_bit_depth -> %d", bit_depth));  // TEMPORARY DIAGNOSTIC
 
 	// Everything downstream of the depth is now wrong: the shader's format qualifier, the plane
 	// textures' data format, and the uniform sets (which are created against a specific shader and
@@ -701,6 +703,7 @@ void YUVGPUConverter::_convert_internal() {
 				vformat("YUV plane uniform set %d is invalid; refusing to dispatch.", (int)i));
 	}
 
+	print_line("[10bitdiag] about to dispatch");  // TEMPORARY DIAGNOSTIC
 	ComputeListID compute_list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(compute_list, pipeline);
 
@@ -717,6 +720,7 @@ void YUVGPUConverter::_convert_internal() {
 
 	rd->compute_list_dispatch(compute_list, Math::ceil(frame_size.x / 8.0f), Math::ceil(frame_size.y / 8.0f), 1);
 	rd->compute_list_end();
+	print_line("[10bitdiag] dispatch survived");  // TEMPORARY DIAGNOSTIC
 }
 
 Ref<Texture2D> YUVGPUConverter::get_output_texture() const {
