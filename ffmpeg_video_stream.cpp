@@ -90,6 +90,7 @@ typedef RD::ComputeListID ComputeListID;
 
 #include "tracy_import.h"
 #include "yuv_to_rgb.glsl.gen.h"
+#include "yuv_to_rgb_10bit.glsl.gen.h"
 
 #ifdef GDEXTENSION
 #define FREE_RD_RID(rid) RS::get_singleton()->get_rendering_device()->free_rid(rid);
@@ -192,7 +193,7 @@ void FFmpegVideoStreamPlayback::update_internal(double p_delta) {
 #ifndef FFMPEG_MT_GPU_UPLOAD
 	if (got_new_frame) {
 		// YUV conversion
-		if (last_frame->get_format() == FFmpegFrameFormat::YUV420P || last_frame->get_format() == FFmpegFrameFormat::YUVA420P) {
+		if (ffmpeg_frame_format_is_yuv(last_frame->get_format())) {
 			Ref<Image> y_plane = last_frame->get_yuv_image_plane(0);
 			Ref<Image> u_plane = last_frame->get_yuv_image_plane(1);
 			Ref<Image> v_plane = last_frame->get_yuv_image_plane(2);
@@ -202,6 +203,9 @@ void FFmpegVideoStreamPlayback::update_internal(double p_delta) {
 			ERR_FAIL_COND(!u_plane.is_valid());
 			ERR_FAIL_COND(!v_plane.is_valid());
 
+			// Before the planes, so a depth change tears down the old shader and textures first. A
+			// no-op on every frame but the first of a differently-encoded video.
+			yuv_converter->set_bit_depth(ffmpeg_frame_format_bytes_per_sample(last_frame->get_format()) == 2 ? 10 : 8);
 			yuv_converter->set_plane_image(0, y_plane);
 			yuv_converter->set_plane_image(1, u_plane);
 			yuv_converter->set_plane_image(2, v_plane);
@@ -426,14 +430,15 @@ void YUVGPUConverter::_ensure_pipeline() {
 	Ref<RDShaderSource> shader_source;
 	shader_source.instantiate();
 	// Ugly hack to skip the #[compute] in the header, because parse_versions_from_text is not available through GDNative
-	shader_source->set_stage_source(RenderingDevice::ShaderStage::SHADER_STAGE_COMPUTE, yuv_to_rgb_shader_glsl + 10);
+	shader_source->set_stage_source(RenderingDevice::ShaderStage::SHADER_STAGE_COMPUTE,
+			(bit_depth > 8 ? yuv_to_rgb_10bit_shader_glsl : yuv_to_rgb_shader_glsl) + 10);
 	Ref<RDShaderSPIRV> shader_spirv = rd->shader_compile_spirv_from_source(shader_source);
 
 #else
 
 	Ref<RDShaderFile> shader_file;
 	shader_file.instantiate();
-	Error err = shader_file->parse_versions_from_text(yuv_to_rgb_shader_glsl);
+	Error err = shader_file->parse_versions_from_text(bit_depth > 8 ? yuv_to_rgb_10bit_shader_glsl : yuv_to_rgb_shader_glsl);
 	if (err != OK) {
 		print_line("Something catastrophic happened, call eirexe");
 	}
@@ -447,6 +452,8 @@ void YUVGPUConverter::_ensure_pipeline() {
 Error YUVGPUConverter::_ensure_plane_textures() {
 	RD *rd = RS::get_singleton()->get_rendering_device();
 	for (size_t i = 0; i < std::size(yuv_plane_textures); i++) {
+		const RenderingDevice::DataFormat desired_data_format =
+				bit_depth > 8 ? RenderingDevice::DATA_FORMAT_R16_UNORM : RenderingDevice::DATA_FORMAT_R8_UNORM;
 		if (yuv_plane_textures[i].is_valid()) {
 			RDTextureFormatC format = TEXTURE_FORMAT_COMPAT(rd->texture_get_format(yuv_plane_textures[i]));
 
@@ -467,7 +474,7 @@ Error YUVGPUConverter::_ensure_plane_textures() {
 		}
 
 		RDTextureFormatC new_format;
-		new_format.format = RenderingDevice::DATA_FORMAT_R8_UNORM;
+		new_format.format = desired_data_format;
 		// chroma planes are half the size of the luma plane
 		new_format.width = i == 0 || i == 3 ? frame_size.width : Math::ceil(frame_size.width / 2.0f);
 		new_format.height = i == 0 || i == 3 ? frame_size.height : Math::ceil(frame_size.height / 2.0f);
@@ -584,8 +591,54 @@ void YUVGPUConverter::set_plane_image(int p_plane_idx, Ref<Image> p_image) {
 	int desired_frame_height = p_plane_idx == 0 || p_plane_idx == 3 ? frame_size.height : Math::ceil(frame_size.height / 2.0f);
 	ERR_FAIL_COND_MSG(p_image->get_width() != desired_frame_width, vformat("Wrong YUV plane width for plane %d, expected %d got %d", p_plane_idx, desired_frame_width, p_image->get_width()));
 	ERR_FAIL_COND_MSG(p_image->get_height() != desired_frame_height, vformat("Wrong YUV plane height for plane %, expected %d got %d", p_plane_idx, desired_frame_height, p_image->get_height()));
-	ERR_FAIL_COND_MSG(p_image->get_format() != Image::FORMAT_R8, "Wrong image format, expected R8");
+	// FORMAT_RH is the 2-bytes-per-pixel carrier used for 10-bit planes - see _unwrap_yuv_frame. It is
+	// never read as half-float; the RD texture's R16_UNORM format is what gives the bytes meaning.
+	const Image::Format expected_format = bit_depth > 8 ? Image::FORMAT_RH : Image::FORMAT_R8;
+	ERR_FAIL_COND_MSG(p_image->get_format() != expected_format,
+			vformat("Wrong image format for %d-bit planes, expected %d got %d", bit_depth, expected_format, p_image->get_format()));
 	yuv_plane_images[p_plane_idx] = p_image;
+}
+
+void YUVGPUConverter::set_bit_depth(int p_bit_depth) {
+	if (bit_depth == p_bit_depth) {
+		return;
+	}
+	bit_depth = p_bit_depth;
+
+	// Everything downstream of the depth is now wrong: the shader's format qualifier, the plane
+	// textures' data format, and the uniform sets (which are created against a specific shader and
+	// cannot be rebound). Drop them all and let the _ensure_* calls rebuild on the next convert().
+	if (pipeline.is_valid()) {
+		FREE_RD_RID(pipeline);
+		pipeline = RID();
+	}
+	if (shader.is_valid()) {
+		FREE_RD_RID(shader);
+		shader = RID();
+	}
+	for (size_t i = 0; i < std::size(yuv_plane_textures); i++) {
+		if (yuv_planes_uniform_sets[i].is_valid()) {
+			FREE_RD_RID(yuv_planes_uniform_sets[i]);
+			yuv_planes_uniform_sets[i] = RID();
+		}
+		if (yuv_plane_textures[i].is_valid()) {
+			FREE_RD_RID(yuv_plane_textures[i]);
+			yuv_plane_textures[i] = RID();
+		}
+		yuv_plane_images[i].unref();
+	}
+	// The output uniform set is bound to the old shader too. Freeing it alone is NOT enough:
+	// _ensure_output_texture returns early whenever the output texture already matches the frame size,
+	// and the uniform set is only created on the path past that check - so it would stay dead and the
+	// dispatch would bind an invalid set. Clear the texture's RID as well to force the full rebuild.
+	if (out_uniform_set.is_valid()) {
+		FREE_RD_RID(out_uniform_set);
+		out_uniform_set = RID();
+	}
+	if (out_texture.is_valid() && out_texture->get_texture_rd_rid().is_valid()) {
+		FREE_RD_RID(out_texture->get_texture_rd_rid());
+		out_texture->set_texture_rd_rid(RID());
+	}
 }
 
 Vector2i YUVGPUConverter::get_frame_size() const { return frame_size; }

@@ -37,6 +37,7 @@ else:
 ffmpeg_install_action = ffmpeg_download.ffmpeg_install(env_ffmpeg, "#bin", ffmpeg_path)
 
 env_ffmpeg.GLSL_HEADER("yuv_to_rgb.glsl")
+env_ffmpeg.GLSL_HEADER("yuv_to_rgb_10bit.glsl")
 env_ffmpeg.Depends(Glob("*.glsl.gen.h"), ["#glsl_builders.py"])
 
 # env_ffmpeg.Append(CPPDEFINES=["FFMPEG_MT_GPU_UPLOAD"])

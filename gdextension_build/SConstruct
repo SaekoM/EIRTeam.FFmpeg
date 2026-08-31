@@ -121,6 +121,7 @@ env.Depends(sources, env.Install(addon_base_dir, "ffmpeg.gdextension"))
 env.Depends(sources, ffmpeg_install_action)
 
 env.GLSL_HEADER("../yuv_to_rgb.glsl")
+env.GLSL_HEADER("../yuv_to_rgb_10bit.glsl")
 env.Depends(Glob("../*.glsl.gen.h"), ["#glsl_builders.py"])
 
 Default(library)

@@ -63,6 +63,11 @@ class YUVGPUConverter : public RefCounted {
 	Ref<Texture2DRD> out_texture;
 	RID out_uniform_set;
 	Vector2i frame_size;
+	// 8 or 10. Decides three things that must move together: which compute shader is compiled, whether
+	// the plane textures are R8_UNORM or R16_UNORM, and how many bytes per sample arrive from the
+	// decoder. Changing it tears down the pipeline, the textures AND the uniform sets, because a
+	// uniform set is created against a specific shader and cannot be rebound to another.
+	int bit_depth = 8;
 
 	struct PushConstant {
 		uint32_t use_alpha;
@@ -79,6 +84,8 @@ private:
 	void _convert_internal();
 
 public:
+	// Call before set_plane_image for a frame. A no-op unless the depth actually changed.
+	void set_bit_depth(int p_bit_depth);
 	void set_plane_image(int p_plane_idx, Ref<Image> p_image);
 	Vector2i get_frame_size() const;
 	void set_frame_size(const Vector2i &p_frame_size);

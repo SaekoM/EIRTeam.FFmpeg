@@ -72,7 +72,27 @@ enum FFmpegFrameFormat {
 	RGBA8,
 	YUV420P,
 	YUVA420P,
+	// 10-bit 4:2:0. Kept as a separate format rather than a flag because it changes three things at
+	// once: two bytes per sample instead of one, an R16 texture instead of R8, and a different compute
+	// shader. Most AV1 and HEVC in circulation is 10-bit, so this is not an exotic case.
+	YUV420P10,
+	YUVA420P10,
 };
+
+// A YUV format is anything the GPU converter can take as planes; RGBA8 is the CPU fallback.
+inline bool ffmpeg_frame_format_is_yuv(FFmpegFrameFormat p_format) {
+	return p_format != FFmpegFrameFormat::RGBA8;
+}
+
+inline int ffmpeg_frame_format_plane_count(FFmpegFrameFormat p_format) {
+	return (p_format == FFmpegFrameFormat::YUVA420P || p_format == FFmpegFrameFormat::YUVA420P10) ? 4 : 3;
+}
+
+// Bytes per sample in ONE plane. 10-bit samples occupy a whole 16-bit word each, with the value in the
+// low 10 bits - see the scaling note in yuv_to_rgb_10bit.glsl.
+inline int ffmpeg_frame_format_bytes_per_sample(FFmpegFrameFormat p_format) {
+	return (p_format == FFmpegFrameFormat::YUV420P10 || p_format == FFmpegFrameFormat::YUVA420P10) ? 2 : 1;
+}
 
 class DecodedFrame : public RefCounted {
 	double time;
