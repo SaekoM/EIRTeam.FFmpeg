@@ -39,7 +39,10 @@
 
 #ifdef GDEXTENSION
 #include "gdextension_build/gdex_print.h"
+#include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/classes/rendering_server.hpp>
+#else
+#include "core/config/project_settings.h"
 #endif
 
 extern "C" {
@@ -48,6 +51,23 @@ extern "C" {
 }
 
 const int MAX_PENDING_FRAMES = 3;
+
+// The project setting a game turns off to keep decoding on the processor. Read each time a video opens, so a change
+// applies from the next video. On unless the game says otherwise.
+const char *HARDWARE_DECODING_SETTING = "ffmpeg/hardware_decoding";
+
+// The hardware decoders to try, best first. D3D11VA is the modern Windows API; DXVA2 is for older drivers. Other
+// platforms have neither and simply decode on the processor.
+const AVHWDeviceType HARDWARE_DEVICE_PREFERENCE[] = { AV_HWDEVICE_TYPE_D3D11VA, AV_HWDEVICE_TYPE_DXVA2 };
+
+// A hardware decoder hands its frames back semi-planar: the Y plane, then U and V interleaved in one plane. P010 holds
+// 10-bit samples in the HIGH bits of each 16-bit word, where YUV420P10 (what the GPU converter expects) holds them
+// in the low bits.
+const int P010_SAMPLE_SHIFT = 6;
+
+bool is_semi_planar_pixel_format(int p_fmt) {
+	return p_fmt == AV_PIX_FMT_NV12 || p_fmt == AV_PIX_FMT_P010LE;
+}
 
 bool is_hardware_pixel_format(AVPixelFormat p_fmt) {
 	switch (p_fmt) {
@@ -239,12 +259,22 @@ Error VideoDecoder::recreate_codec_context() {
 
 	ERR_FAIL_COND_V_MSG(param_copy_result < 0, FAILED, vformat("Couldn't copy codec parameters from %s: %s", decoder->name, ffmpeg_get_error_message(param_copy_result)));
 
-	video_codec_context->thread_count = 0;
+	hw_pixel_format = AV_PIX_FMT_NONE;
+	if (!_hardware_decoding_wanted() || !_attach_hardware_device(decoder)) {
+		video_codec_context->thread_count = 0;
+	}
 
 	int open_codec_result = avcodec_open2(video_codec_context, decoder, nullptr);
+	if (open_codec_result < 0 && hw_pixel_format != AV_PIX_FMT_NONE) {
+		// The device was made but the decoder wouldn't open on it: try once more on the processor.
+		print_line(vformat("Hardware video decoding failed to open (%s); decoding on the processor.", ffmpeg_get_error_message(open_codec_result)));
+		hw_decoding_failed = true;
+		return recreate_codec_context();
+	}
 	ERR_FAIL_COND_V_MSG(open_codec_result < 0, FAILED, vformat("Error trying to open %s codec: %s", decoder->name, ffmpeg_get_error_message(open_codec_result)));
 
-	print_line("Succesfully initialized video decoder:", decoder->long_name);
+	print_line("Succesfully initialized video decoder:", decoder->long_name,
+			hw_pixel_format != AV_PIX_FMT_NONE ? "(hardware)" : "(processor)");
 
 	ERR_FAIL_COND_V_MSG(video_codec_context == nullptr, ERR_CANT_CREATE, vformat("Error creating video codec context: Exhausted all available decoders for codec %s", avcodec_get_name(video_stream->codecpar->codec_id)));
 
@@ -409,6 +439,9 @@ void VideoDecoder::_read_decoded_frames(AVFrame *p_received_frame) {
 		if (receive_frame_result < 0) {
 			if (receive_frame_result != -EAGAIN && receive_frame_result != AVERROR_EOF) {
 				print_line(vformat("Failed to receive frame from avcodec: %s", ffmpeg_get_error_message(receive_frame_result)));
+				if (hw_pixel_format != AV_PIX_FMT_NONE) {
+					_fall_back_to_software(ffmpeg_get_error_message(receive_frame_result));
+				}
 			}
 
 			break;
@@ -427,11 +460,19 @@ void VideoDecoder::_read_decoded_frames(AVFrame *p_received_frame) {
 		frame.instantiate();
 		av_frame_move_ref(frame->get_frame(), p_received_frame);
 
+		if (is_hardware_pixel_format((AVPixelFormat)frame->get_frame()->format)) {
+			frame = _transfer_from_hardware(frame);
+			if (!frame.is_valid()) {
+				break; // decoding has fallen back to the processor and restarts from this frame's time
+			}
+		}
+
 		last_decoded_frame_time.set(frame_time);
 
 		if (ffmpeg_frame_format_is_yuv(frame_format)) {
 			// Special path for YUV images
 			Ref<DecodedFrame> yuv_frame = _unwrap_yuv_frame(frame_time, frame, frame_format);
+			frame->do_return();
 			decoded_frames_mutex->lock();
 			if (!skip_current_outputs.is_set()) {
 				decoded_frames.push_back(yuv_frame);
@@ -612,9 +653,76 @@ Ref<FFmpegFrame> VideoDecoder::_ensure_frame_pixel_format(Ref<FFmpegFrame> p_fra
 	return scaler_frame;
 }
 
+// Splits a semi-planar frame (NV12 or P010, from a hardware decoder) into separate Y, U and V planes, the layout the
+// GPU converter takes. A plain memory pass: the Y plane is copied, and the interleaved chroma plane is pulled apart.
+// P010's samples come down from the high bits as they go.
+static void split_semi_planar_frame(const AVFrame *p_frame, int p_bytes_per_sample, PackedByteArray p_planes[3]) {
+	const int width = p_frame->width;
+	const int height = p_frame->height;
+	const int chroma_width = (width + 1) / 2;
+	const int chroma_height = (height + 1) / 2;
+	const bool ten_bit = p_bytes_per_sample == 2;
+
+	p_planes[0].resize(width * height * p_bytes_per_sample);
+	uint8_t *y_out = p_planes[0].ptrw();
+	for (int row = 0; row < height; row++) {
+		const uint8_t *y_in = p_frame->data[0] + row * p_frame->linesize[0];
+		if (!ten_bit) {
+			memcpy(y_out + row * width, y_in, width);
+			continue;
+		}
+		const uint16_t *samples_in = (const uint16_t *)y_in;
+		uint16_t *samples_out = (uint16_t *)(y_out + row * width * 2);
+		for (int x = 0; x < width; x++) {
+			samples_out[x] = samples_in[x] >> P010_SAMPLE_SHIFT;
+		}
+	}
+
+	p_planes[1].resize(chroma_width * chroma_height * p_bytes_per_sample);
+	p_planes[2].resize(chroma_width * chroma_height * p_bytes_per_sample);
+	uint8_t *u_out = p_planes[1].ptrw();
+	uint8_t *v_out = p_planes[2].ptrw();
+	for (int row = 0; row < chroma_height; row++) {
+		const uint8_t *uv_in = p_frame->data[1] + row * p_frame->linesize[1];
+		if (!ten_bit) {
+			uint8_t *u_row = u_out + row * chroma_width;
+			uint8_t *v_row = v_out + row * chroma_width;
+			for (int x = 0; x < chroma_width; x++) {
+				u_row[x] = uv_in[x * 2];
+				v_row[x] = uv_in[x * 2 + 1];
+			}
+			continue;
+		}
+		const uint16_t *samples_in = (const uint16_t *)uv_in;
+		uint16_t *u_row = (uint16_t *)(u_out + row * chroma_width * 2);
+		uint16_t *v_row = (uint16_t *)(v_out + row * chroma_width * 2);
+		for (int x = 0; x < chroma_width; x++) {
+			u_row[x] = samples_in[x * 2] >> P010_SAMPLE_SHIFT;
+			v_row[x] = samples_in[x * 2 + 1] >> P010_SAMPLE_SHIFT;
+		}
+	}
+}
+
 Ref<DecodedFrame> VideoDecoder::_unwrap_yuv_frame(double p_frame_time, Ref<FFmpegFrame> p_frame, FFmpegFrameFormat p_out_format) {
 	PackedByteArray temp_frame_storage;
 	Ref<DecodedFrame> out_frame = memnew(DecodedFrame(p_frame_time, Ref<Image>()));
+	if (is_semi_planar_pixel_format(p_frame->get_frame()->format)) {
+		ZoneNamedN(yuv_image_split, "YUV semi-planar split", true);
+		const int bytes_per_sample = ffmpeg_frame_format_bytes_per_sample(p_out_format);
+		PackedByteArray planes[3];
+		split_semi_planar_frame(p_frame->get_frame(), bytes_per_sample, planes);
+		const Image::Format plane_format = bytes_per_sample == 2 ? Image::FORMAT_RH : Image::FORMAT_R8;
+		const int width = p_frame->get_frame()->width;
+		const int height = p_frame->get_frame()->height;
+		for (int plane_i = 0; plane_i < 3; plane_i++) {
+			const int plane_width = plane_i == 0 ? width : (width + 1) / 2;
+			const int plane_height = plane_i == 0 ? height : (height + 1) / 2;
+			out_frame->set_yuv_image_plane(plane_i,
+					Image::create_from_data(plane_width, plane_height, false, plane_format, planes[plane_i]));
+		}
+		out_frame->set_format(p_out_format);
+		return out_frame;
+	}
 	const int frame_plane_count = ffmpeg_frame_format_plane_count(p_out_format);
 	// 1 for 8-bit, 2 for 10-bit. Every width below is a SAMPLE count, so anything measured in bytes
 	// has to be multiplied by this - that is the whole of the 10-bit change on this side.
@@ -654,6 +762,130 @@ Ref<DecodedFrame> VideoDecoder::_unwrap_yuv_frame(double p_frame_time, Ref<FFmpe
 	out_frame->set_format(p_out_format);
 
 	return out_frame;
+}
+
+// ── Hardware decoding ───────────────────────────────────────────────────────
+
+bool VideoDecoder::_hardware_decoding_wanted() const {
+	if (hw_decoding_failed) {
+		return false;
+	}
+	// The GPU converter takes three planes; a frame with alpha has four, and no hardware decoder gives alpha anyway.
+	if (frame_format == FFmpegFrameFormat::YUVA420P || frame_format == FFmpegFrameFormat::YUVA420P10) {
+		return false;
+	}
+	return bool(ProjectSettings::get_singleton()->get_setting(HARDWARE_DECODING_SETTING, true));
+}
+
+// Attaches the best hardware device the decoder can use. Returns false, leaving the processor to decode, when there
+// is none: an unsupported codec, a device that won't start, or a platform without D3D.
+bool VideoDecoder::_attach_hardware_device(const AVCodec *p_decoder) {
+	for (AVHWDeviceType device_type : HARDWARE_DEVICE_PREFERENCE) {
+		AVPixelFormat device_pixel_format = AV_PIX_FMT_NONE;
+		for (int config_i = 0;; config_i++) {
+			const AVCodecHWConfig *config = avcodec_get_hw_config(p_decoder, config_i);
+			if (config == nullptr) {
+				break;
+			}
+			if (config->device_type == device_type && (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX)) {
+				device_pixel_format = config->pix_fmt;
+				break;
+			}
+		}
+		if (device_pixel_format == AV_PIX_FMT_NONE) {
+			continue;
+		}
+		AVBufferRef *device = nullptr;
+		int create_result = av_hwdevice_ctx_create(&device, device_type, nullptr, nullptr, 0);
+		if (create_result < 0) {
+			print_line(vformat("Hardware video decoder %s unavailable: %s", av_hwdevice_get_type_name(device_type), ffmpeg_get_error_message(create_result)));
+			continue;
+		}
+		video_codec_context->hw_device_ctx = device; // the context owns it from here
+		video_codec_context->opaque = this;
+		video_codec_context->get_format = &VideoDecoder::_pick_pixel_format;
+		hw_pixel_format = device_pixel_format;
+		print_line(vformat("Hardware video decoding: %s for %s", av_hwdevice_get_type_name(device_type), p_decoder->name));
+		return true;
+	}
+	return false;
+}
+
+// FFmpeg asks which format to decode into once it has read the stream. The hardware's format when it's offered;
+// when it isn't (a profile or size the hardware can't do), the first format the processor can decode into, which
+// makes FFmpeg decode this video in software.
+AVPixelFormat VideoDecoder::_pick_pixel_format(AVCodecContext *p_context, const AVPixelFormat *p_formats) {
+	VideoDecoder *decoder = (VideoDecoder *)p_context->opaque;
+	for (const AVPixelFormat *format = p_formats; *format != AV_PIX_FMT_NONE; format++) {
+		if (*format == decoder->hw_pixel_format) {
+			return *format;
+		}
+	}
+	print_line("Hardware video decoding can't take this video; decoding on the processor.");
+	decoder->hw_pixel_format = AV_PIX_FMT_NONE;
+	for (const AVPixelFormat *format = p_formats; *format != AV_PIX_FMT_NONE; format++) {
+		if (!is_hardware_pixel_format(*format)) {
+			return *format;
+		}
+	}
+	return AV_PIX_FMT_NONE;
+}
+
+// Copies a decoded frame out of the graphics chip's memory into ordinary memory, reusing a returned frame when there
+// is one. An invalid result means it failed and decoding has fallen back to the processor.
+Ref<FFmpegFrame> VideoDecoder::_transfer_from_hardware(Ref<FFmpegFrame> p_hw_frame) {
+	ZoneScopedN("Video decoder hardware transfer");
+	Ref<FFmpegFrame> transfer_frame;
+	hw_transfer_frames_mutex->lock();
+	if (hw_transfer_frames.size() > 0) {
+		transfer_frame = hw_transfer_frames.front()->get();
+		hw_transfer_frames.pop_front();
+	}
+	hw_transfer_frames_mutex->unlock();
+	if (!transfer_frame.is_valid()) {
+		transfer_frame.instantiate();
+		transfer_frame->connect("return_frame", callable_mp(this, &VideoDecoder::_hw_transfer_frame_return));
+	}
+	AVFrame *hw = p_hw_frame->get_frame();
+	AVFrame *out = transfer_frame->get_frame();
+	// A reused frame keeps its buffers, and the copy goes straight into them, unless the video's size has changed.
+	if (out->buf[0] != nullptr && (out->width != hw->width || out->height != hw->height)) {
+		av_frame_unref(out);
+	}
+	int transfer_result = av_hwframe_transfer_data(out, hw, 0);
+	av_frame_unref(hw);
+	if (transfer_result < 0) {
+		av_frame_unref(out);
+		_fall_back_to_software(ffmpeg_get_error_message(transfer_result));
+		return Ref<FFmpegFrame>();
+	}
+	return transfer_frame;
+}
+
+void VideoDecoder::_hw_transfer_frame_return(Ref<FFmpegFrame> p_hw_frame) {
+	hw_transfer_frames_mutex->lock();
+	hw_transfer_frames.push_back(p_hw_frame);
+	hw_transfer_frames_mutex->unlock();
+}
+
+// Something went wrong on the hardware mid-video. Hardware decoding stays off for this video, and once the decoder
+// thread is done with this batch of frames, the decoder reopens on the processor and picks up where it was.
+void VideoDecoder::_fall_back_to_software(const String &p_reason) {
+	if (hw_decoding_failed) {
+		return;
+	}
+	hw_decoding_failed = true;
+	print_line(vformat("Hardware video decoding failed (%s); switching to the processor.", p_reason));
+	decoder_commands.push(this, &VideoDecoder::_reopen_in_software);
+}
+
+void VideoDecoder::_reopen_in_software() {
+	if (recreate_codec_context() != OK) {
+		decoder_state = DecoderState::FAULTED;
+		return;
+	}
+	// A fresh decoder needs a keyframe, so seek back to it and skip ahead to the last frame shown.
+	_seek_command(last_decoded_frame_time.get());
 }
 
 AVFrame *VideoDecoder::_ensure_frame_audio_format(AVFrame *p_frame, AVSampleFormat p_target_audio_format) {

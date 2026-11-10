@@ -60,6 +60,7 @@ using namespace godot;
 #include "ffmpeg_frame.h"
 extern "C" {
 #include "libavformat/avformat.h"
+#include "libavutil/hwcontext.h"
 #include "libswresample/swresample.h"
 #include "libswscale/swscale.h"
 }
@@ -168,7 +169,11 @@ private:
 	AVCodecContext *audio_codec_context = nullptr;
 	bool input_opened = false;
 	bool has_audio = false;
-	bool hw_decoding_allowed = false;
+	// Hardware decoding (Windows: D3D11VA, then DXVA2). The pixel format the attached device decodes into, or
+	// AV_PIX_FMT_NONE when the processor is decoding. Once hardware decoding has failed for this video it stays off,
+	// so a driver that can't cope is asked once, not on every frame.
+	AVPixelFormat hw_pixel_format = AV_PIX_FMT_NONE;
+	bool hw_decoding_failed = false;
 	double video_time_base_in_seconds;
 	double audio_time_base_in_seconds;
 	double duration;
@@ -195,13 +200,18 @@ private:
 	static int64_t _stream_seek_callback(void *p_opaque, int64_t p_offset, int p_whence);
 	void prepare_decoding();
 	Error recreate_codec_context();
+	bool _hardware_decoding_wanted() const;
+	bool _attach_hardware_device(const AVCodec *p_decoder);
+	static AVPixelFormat _pick_pixel_format(AVCodecContext *p_context, const AVPixelFormat *p_formats);
+	void _fall_back_to_software(const String &p_reason);
+	void _reopen_in_software();
+	Ref<FFmpegFrame> _transfer_from_hardware(Ref<FFmpegFrame> p_hw_frame);
 	static HardwareVideoDecoder from_av_hw_device_type(AVHWDeviceType p_device_type);
 
 	void _seek_command(double p_target_timestamp);
 	static void _thread_func(void *userdata);
 	void _decode_next_frame(AVPacket *p_packet, AVFrame *p_receive_frame);
 	int _send_packet(AVCodecContext *p_codec_context, AVFrame *p_receive_frame, AVPacket *p_packet);
-	void _try_disable_hw_decoding(int p_error_code);
 	void _read_decoded_frames(AVFrame *p_received_frame);
 	void _read_decoded_audio_frames(AVFrame *p_received_frame);
 
