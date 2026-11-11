@@ -706,6 +706,7 @@ static void split_semi_planar_frame(const AVFrame *p_frame, int p_bytes_per_samp
 Ref<DecodedFrame> VideoDecoder::_unwrap_yuv_frame(double p_frame_time, Ref<FFmpegFrame> p_frame, FFmpegFrameFormat p_out_format) {
 	PackedByteArray temp_frame_storage;
 	Ref<DecodedFrame> out_frame = memnew(DecodedFrame(p_frame_time, Ref<Image>()));
+	out_frame->set_yuv_colour(ffmpeg_frame_yuv_colour(p_frame->get_frame()));
 	if (is_semi_planar_pixel_format(p_frame->get_frame()->format)) {
 		ZoneNamedN(yuv_image_split, "YUV semi-planar split", true);
 		const int bytes_per_sample = ffmpeg_frame_format_bytes_per_sample(p_out_format);
@@ -853,6 +854,10 @@ Ref<FFmpegFrame> VideoDecoder::_transfer_from_hardware(Ref<FFmpegFrame> p_hw_fra
 		av_frame_unref(out);
 	}
 	int transfer_result = av_hwframe_transfer_data(out, hw, 0);
+	if (transfer_result >= 0) {
+		// The copy carries pixels only. Its colour tags (standard, range) and timing come from the hardware frame.
+		transfer_result = av_frame_copy_props(out, hw);
+	}
 	av_frame_unref(hw);
 	if (transfer_result < 0) {
 		av_frame_unref(out);
@@ -1128,6 +1133,30 @@ double DecodedAudioFrame::get_time() const {
 PackedFloat32Array DecodedAudioFrame::get_sample_data() const {
 	return sample_data;
 }
+YUVColour ffmpeg_frame_yuv_colour(const AVFrame *p_frame) {
+	YUVColour colour;
+	colour.full_range = p_frame->color_range == AVCOL_RANGE_JPEG;
+	switch (p_frame->colorspace) {
+		case AVCOL_SPC_BT709: {
+			colour.matrix = YUVColour::BT709;
+		} break;
+		case AVCOL_SPC_BT470BG:
+		case AVCOL_SPC_SMPTE170M:
+		case AVCOL_SPC_FCC: {
+			colour.matrix = YUVColour::BT601;
+		} break;
+		case AVCOL_SPC_BT2020_NCL:
+		case AVCOL_SPC_BT2020_CL: {
+			colour.matrix = YUVColour::BT2020;
+		} break;
+		default: {
+			// Untagged: what media players assume, HD from 720 lines up and SD below.
+			colour.matrix = p_frame->height >= 720 ? YUVColour::BT709 : YUVColour::BT601;
+		} break;
+	}
+	return colour;
+}
+
 String ffmpeg_get_error_message(int p_error_code) {
 	const uint64_t buffer_size = 256;
 	Vector<char> buffer;

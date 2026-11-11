@@ -95,12 +95,28 @@ inline int ffmpeg_frame_format_bytes_per_sample(FFmpegFrameFormat p_format) {
 	return (p_format == FFmpegFrameFormat::YUV420P10 || p_format == FFmpegFrameFormat::YUVA420P10) ? 2 : 1;
 }
 
+// How a frame's YUV turns into RGB: the colour standard it was made for (which sets the conversion matrix), and
+// whether its values span the full range or the limited "TV" range (16-235 at 8-bit) that almost all video uses.
+// Read from the frame's own tags by ffmpeg_frame_yuv_colour.
+struct YUVColour {
+	enum Matrix {
+		BT601, // standard definition
+		BT709, // HD
+		BT2020, // UHD / HDR
+	};
+	Matrix matrix = BT709;
+	bool full_range = false;
+};
+
+YUVColour ffmpeg_frame_yuv_colour(const AVFrame *p_frame);
+
 class DecodedFrame : public RefCounted {
 	double time;
 	Ref<ImageTexture> texture;
 	Ref<Image> image;
 	Ref<Image> yuv_images[4];
 	FFmpegFrameFormat format;
+	YUVColour yuv_colour;
 
 public:
 	Ref<ImageTexture> get_texture() const;
@@ -118,6 +134,9 @@ public:
 
 	FFmpegFrameFormat get_format() const { return format; }
 	void set_format(const FFmpegFrameFormat &p_format) { format = p_format; }
+
+	YUVColour get_yuv_colour() const { return yuv_colour; }
+	void set_yuv_colour(const YUVColour &p_colour) { yuv_colour = p_colour; }
 };
 
 class DecodedAudioFrame : public RefCounted {

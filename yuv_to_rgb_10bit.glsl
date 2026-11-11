@@ -20,8 +20,21 @@ layout(r16, set = 2, binding = 0) uniform restrict readonly image2D tex_v;
 layout(r16, set = 3, binding = 0) uniform restrict readonly image2D tex_a;
 layout(rgba8, set = 4, binding = 0) uniform restrict writeonly image2D output_image;
 
+// Set per video by YUVGPUConverter (fill_colour_constants): the video's range and colour standard. Matches the C++
+// PushConstant member for member.
 layout(push_constant, std430) uniform Params {
-	bool use_alpha;
+	uint use_alpha;
+	float luma_offset;
+	float luma_scale;
+	float chroma_offset;
+	float chroma_scale;
+	float red_from_v;
+	float green_from_u;
+	float green_from_v;
+	float blue_from_u;
+	float padding_0;
+	float padding_1;
+	float padding_2;
 }
 params;
 
@@ -39,13 +52,15 @@ void main() {
 	vec2 chroma;
 	chroma.r = imageLoad(tex_u, uv_chroma).r * TEN_BIT_SCALE;
 	chroma.g = imageLoad(tex_v, uv_chroma).r * TEN_BIT_SCALE;
-	float u = chroma.r - 0.5;
-	float v = chroma.g - 0.5;
+	y = (y - params.luma_offset) * params.luma_scale;
+	float u = (chroma.r - params.chroma_offset) * params.chroma_scale;
+	float v = (chroma.g - params.chroma_offset) * params.chroma_scale;
 	vec4 rgba;
-	rgba.r = y + (1.403 * v);
-	rgba.g = y - (0.344 * u) - (0.714 * v);
-	rgba.b = y + (1.770 * u);
-	if (params.use_alpha) {
+	rgba.r = y + params.red_from_v * v;
+	rgba.g = y + params.green_from_u * u + params.green_from_v * v;
+	rgba.b = y + params.blue_from_u * u;
+	rgba.rgb = clamp(rgba.rgb, 0.0, 1.0); // limited-range video may hold values just past black and white
+	if (params.use_alpha != 0u) {
 		rgba.a = imageLoad(tex_a, uv).r * TEN_BIT_SCALE;
 	} else {
 		rgba.a = 1.0;

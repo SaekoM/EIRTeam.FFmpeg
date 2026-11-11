@@ -76,9 +76,23 @@ class YUVGPUConverter : public RefCounted {
 	int bit_depth = 8;
 	int pending_bit_depth = 8;
 
+	// Written by the main thread as frames arrive, read on the render thread like the plane images.
+	YUVColour colour;
+
+	// Matches Params in both yuv_to_rgb shaders, member for member: 12 four-byte values, 48 bytes.
 	struct PushConstant {
 		uint32_t use_alpha;
-		uint8_t padding[11];
+		// Limited range is stretched to full: (sample - offset) * scale, luma and chroma separately.
+		float luma_offset;
+		float luma_scale;
+		float chroma_offset;
+		float chroma_scale;
+		// The colour standard's matrix, as the four terms that aren't 0 or 1.
+		float red_from_v;
+		float green_from_u;
+		float green_from_v;
+		float blue_from_u;
+		float padding[3];
 	} push_constant;
 
 private:
@@ -95,6 +109,8 @@ public:
 	// Records what the decoder is now producing. Cheap and thread-safe: the actual teardown happens on
 	// the render thread the next time convert() runs.
 	void set_bit_depth(int p_bit_depth);
+	// The colour standard and range of the frames now arriving. Cheap; read when the next frame is converted.
+	void set_colour(const YUVColour &p_colour);
 	void set_plane_image(int p_plane_idx, Ref<Image> p_image);
 	Vector2i get_frame_size() const;
 	void set_frame_size(const Vector2i &p_frame_size);

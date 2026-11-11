@@ -210,6 +210,7 @@ void FFmpegVideoStreamPlayback::update_internal(double p_delta) {
 			// Before the planes, so a depth change tears down the old shader and textures first. A
 			// no-op on every frame but the first of a differently-encoded video.
 			yuv_converter->set_bit_depth(ffmpeg_frame_format_bytes_per_sample(last_frame->get_format()) == 2 ? 10 : 8);
+			yuv_converter->set_colour(last_frame->get_yuv_colour());
 			yuv_converter->set_plane_image(0, y_plane);
 			yuv_converter->set_plane_image(1, u_plane);
 			yuv_converter->set_plane_image(2, v_plane);
@@ -633,6 +634,44 @@ void YUVGPUConverter::set_plane_image(int p_plane_idx, Ref<Image> p_image) {
 	yuv_plane_images[p_plane_idx] = p_image;
 }
 
+void YUVGPUConverter::set_colour(const YUVColour &p_colour) {
+	colour = p_colour;
+}
+
+// The shader's conversion for `p_colour` at `p_bit_depth`. Luma and chroma are stretched from the limited range to
+// full when the video uses it (8-bit luma 16-235 and chroma 16-240, four times those codes at 10-bit), and the
+// matrix comes from the standard's red and blue weights.
+static void fill_colour_constants(const YUVColour &p_colour, int p_bit_depth, float &r_luma_offset, float &r_luma_scale,
+		float &r_chroma_offset, float &r_chroma_scale, float &r_red_from_v, float &r_green_from_u, float &r_green_from_v,
+		float &r_blue_from_u) {
+	const double max_code = double((1 << p_bit_depth) - 1); // 255 or 1023
+	const double code_step = double(1 << (p_bit_depth - 8)); // one 8-bit code, at this depth
+	r_chroma_offset = float(128.0 * code_step / max_code);
+	if (p_colour.full_range) {
+		r_luma_offset = 0.0f;
+		r_luma_scale = 1.0f;
+		r_chroma_scale = 1.0f;
+	} else {
+		r_luma_offset = float(16.0 * code_step / max_code);
+		r_luma_scale = float(max_code / (219.0 * code_step));
+		r_chroma_scale = float(max_code / (224.0 * code_step));
+	}
+	double red_weight = 0.2126; // BT.709
+	double blue_weight = 0.0722;
+	if (p_colour.matrix == YUVColour::BT601) {
+		red_weight = 0.299;
+		blue_weight = 0.114;
+	} else if (p_colour.matrix == YUVColour::BT2020) {
+		red_weight = 0.2627;
+		blue_weight = 0.0593;
+	}
+	const double green_weight = 1.0 - red_weight - blue_weight;
+	r_red_from_v = float(2.0 * (1.0 - red_weight));
+	r_blue_from_u = float(2.0 * (1.0 - blue_weight));
+	r_green_from_u = float(-2.0 * blue_weight * (1.0 - blue_weight) / green_weight);
+	r_green_from_v = float(-2.0 * red_weight * (1.0 - red_weight) / green_weight);
+}
+
 void YUVGPUConverter::set_bit_depth(int p_bit_depth) {
 	// Main thread. Record only - no RenderingDevice calls here. _convert_internal picks this up on the
 	// render thread and does the teardown there.
@@ -706,6 +745,9 @@ void YUVGPUConverter::_convert_internal() {
 	RD *rd = RS::get_singleton()->get_rendering_device();
 
 	push_constant.use_alpha = yuv_plane_images[3].is_valid() ? 1 : 0;
+	fill_colour_constants(colour, bit_depth, push_constant.luma_offset, push_constant.luma_scale,
+			push_constant.chroma_offset, push_constant.chroma_scale, push_constant.red_from_v,
+			push_constant.green_from_u, push_constant.green_from_v, push_constant.blue_from_u);
 
 	PackedByteArray push_constant_data;
 	push_constant_data.resize(sizeof(push_constant));
